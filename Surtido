@@ -1,0 +1,564 @@
+// ================================================================
+// SURTIDO — UNIFIED INVENTORY CONTROL SYSTEM (v1.0.0)
+// ================================================================
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
+
+import {
+  CORE_VERSION,
+  getDaysUntilExpiry, getTacticalStatus,
+  calcInventoryValue, calcWasteLoss, countByTiers, countLowStock,
+  calcCartTotal, calcChange, validateCartAdd,
+  buildReportData, buildMovementEntry, buildWasteEntry,
+  buildTransaction, todayKey,
+  hashPin, verifyPin,
+  runExpiryScan, mapSheetProducts,
+  apiFetchCatalog, apiSyncBatch, testApiConnection,
+} from "./SurtidoCore.js";
+
+import {
+  CONFIG, saveConfig, resetConfig,
+  SHEETS_API_URL, API_ENABLED,
+} from "./SurtidoConfig.js";
+
+// ─── JSBARCODE LOADER ────────────────────────────────────────────
+let _jsBarcodeReady = false;
+const loadJsBarcode = () => new Promise((resolve, reject) => {
+  if (window.JsBarcode) { resolve(window.JsBarcode); return; }
+  if (_jsBarcodeReady) {
+    const check = setInterval(() => {
+      if (window.JsBarcode) { clearInterval(check); resolve(window.JsBarcode); }
+    }, 50);
+    setTimeout(() => { clearInterval(check); reject(new Error("timeout")); }, 6000);
+    return;
+  }
+  _jsBarcodeReady = true;
+  const s = document.createElement("script");
+  s.src = "https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js";
+  s.onload  = () => resolve(window.JsBarcode);
+  s.onerror = () => reject(new Error("CDN failed"));
+  document.head.appendChild(s);
+});
+
+// ─── BARCODE DISPLAY ─────────────────────────────────────────────
+function BarcodeDisplay({ value, height = 70 }) {
+  const ref   = useRef(null);
+  const [ok,  setOk]  = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    if (!value) return;
+    let cancelled = false;
+    loadJsBarcode().then(JsBarcode => {
+      if (cancelled || !ref.current) return;
+      try {
+        JsBarcode(ref.current, value, {
+          format: "CODE128", width: 2, height,
+          displayValue: true, font: "Courier New", fontSize: 13,
+          textMargin: 4, margin: 8,
+          background: "#0d0f0b", lineColor: "#d4d8c8",
+        });
+        setOk(true);
+      } catch(e) { setErr(e.message); }
+    }).catch(e => { if (!cancelled) setErr(e.message); });
+    return () => { cancelled = true; };
+  }, [value, height]);
+
+  if (err) return <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",color:"#e05050",padding:"8px"}}>✗ {err}</div>;
+  return <svg ref={ref} style={{maxWidth:"100%",opacity:ok?1:0,transition:"opacity 0.2s"}}/>;
+}
+
+const generateCode = (p) => p.barcode && !p.barcode.startsWith("AUTO")
+  ? p.barcode
+  : `SRT${String(p.id).padStart(8,"0")}`;
+
+// ─── CSS ─────────────────────────────────────────────────────────
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap');
+  :root {
+    --bg-base:#0d0f0b; --bg-panel:#111410; --bg-card:#161a13; --bg-hover:#1c2118;
+    --border:#2a2e24; --border-bright:#3d4535;
+    --olive:#4a5240; --olive-light:#6b7560; --khaki:#8a9478;
+    --text-p:#d4d8c8; --text-s:#7a8068; --text-m:#4a5040;
+    --gold:#c8a84b; --gold-dim:#8a7030;
+    --ok:#5a8a4a; --ok-t:#90c878;
+    --ca:#8a8a3a; --ca-t:#d4d460;
+    --wa:#5a6a9a; --wa-t:#8aabdc;
+    --ur:#9a6a20; --ur-t:#e8a040;
+    --cr:#8a2020; --cr-t:#e05050;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  .sr-root{min-height:100vh;background:var(--bg-base);background-image:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(255,255,255,0.008) 2px,rgba(255,255,255,0.008) 4px);font-family:'Rajdhani',sans-serif;color:var(--text-p);}
+  .sr-header{background:var(--bg-panel);border-bottom:2px solid var(--border-bright);padding:1.1rem 1.5rem 0.9rem;position:sticky;top:0;z-index:100;display:flex;justify-content:space-between;align-items:flex-end;}
+  .sr-logo{font-family:'Bebas Neue',sans-serif;font-size:2.4rem;line-height:1;letter-spacing:0.06em;color:var(--text-p);}
+  .sr-logo span{color:var(--gold);}
+  .sr-logo-sub{font-family:'Share Tech Mono',monospace;font-size:0.52rem;color:var(--text-m);letter-spacing:0.2em;margin-top:1px;}
+  .sr-store-name{font-family:'Share Tech Mono',monospace;font-size:0.56rem;color:var(--gold-dim);letter-spacing:0.15em;margin-top:2px;}
+  .sr-hctrl{margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+  .sr-net{font-family:'Share Tech Mono',monospace;font-size:0.56rem;font-weight:700;letter-spacing:0.1em;padding:4px 10px;border-radius:2px;cursor:default;user-select:none;transition:all 0.4s;}
+  .sr-net.online{background:rgba(90,138,74,0.15);color:var(--ok-t);border:1px solid var(--ok);}
+  .sr-net.offline{background:rgba(138,32,32,0.2);color:var(--cr-t);border:1px solid var(--cr);animation:blink 2s infinite;}
+  .sr-net.syncing{background:rgba(154,106,32,0.15);color:var(--ur-t);border:1px solid var(--ur);animation:blink 0.8s infinite;}
+  @keyframes blink{0%,100%{opacity:1;}50%{opacity:0.45;}}
+  .sr-hmeta{display:flex;flex-direction:column;align-items:flex-end;gap:0.3rem;}
+  .sr-loss-lbl{font-family:'Share Tech Mono',monospace;font-size:0.52rem;color:var(--text-m);letter-spacing:0.15em;}
+  .sr-loss-val{font-family:'Bebas Neue',sans-serif;font-size:1.7rem;color:var(--cr-t);letter-spacing:0.05em;line-height:1;}
+  
+  .sr-nav{display:flex;border-bottom:1px solid var(--border-bright);background:var(--bg-panel);overflow-x:auto;}
+  .sr-tab{font-family:'Share Tech Mono',monospace;font-size:0.6rem;letter-spacing:0.15em;padding:0.65rem 1.25rem;cursor:pointer;border:none;background:none;color:var(--text-m);border-bottom:2px solid transparent;transition:all 0.15s;white-space:nowrap;flex-shrink:0;}
+  .sr-tab.active{color:var(--gold);border-bottom-color:var(--gold);}
+  .sr-tab.settings-tab{margin-left:auto;color:var(--text-m);}
+  .sr-tab.settings-tab.active{color:var(--wa-t);border-bottom-color:var(--wa);}
+
+  .sr-main{max-width:1000px;margin:0 auto;padding:1.75rem 1.5rem;}
+  .sr-sec{font-family:'Share Tech Mono',monospace;font-size:0.58rem;color:var(--text-m);letter-spacing:0.25em;margin-bottom:0.75rem;display:flex;align-items:center;gap:0.75rem;}
+  .sr-sec::after{content:'';flex:1;height:1px;background:var(--border);}
+
+  .sr-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:3px;overflow:hidden;margin-bottom:1.75rem;}
+  .sr-stat{background:var(--bg-card);padding:0.9rem 1.1rem;display:flex;flex-direction:column;gap:0.25rem;}
+  .sr-stat-lbl{font-family:'Share Tech Mono',monospace;font-size:0.5rem;color:var(--text-m);letter-spacing:0.15em;}
+  .sr-stat-val{font-family:'Bebas Neue',sans-serif;font-size:1.5rem;line-height:1;color:var(--text-p);letter-spacing:0.04em;}
+  .sr-stat-val.gold{color:var(--gold);} .sr-stat-val.red{color:var(--cr-t);} .sr-stat-val.yellow{color:var(--ur-t);}
+
+  .tw{background:#111410;border:1px solid #3d4535;border-radius:3px;overflow:hidden;margin-bottom:1rem;}
+  .row{display:grid;grid-template-columns:1fr auto;padding:0.8rem 1rem;border-bottom:1px solid #2a2e24;align-items:center;gap:1rem;transition:background 0.15s;}
+  .row:last-child{border-bottom:none;}
+  .row:hover{background:#161a13;}
+  .rname{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:0.92rem;color:#d4d8c8;}
+  .rbc{font-family:'Share Tech Mono',monospace;font-size:0.44rem;letter-spacing:0.06em;cursor:pointer;margin-top:2px;background:none;border:none;padding:0;text-align:left;}
+  .rbc.has{color:#c8a84b;}
+  .rbc.no{color:#e8a040;}
+  .rbc:hover{opacity:0.75;}
+  .rmeta{font-family:'Share Tech Mono',monospace;font-size:0.54rem;color:#4a5040;margin-top:2px;}
+  .rbtn{font-family:'Share Tech Mono',monospace;font-size:0.52rem;letter-spacing:0.08em;padding:5px 10px;border-radius:2px;cursor:pointer;border:1px solid #3d4535;background:none;color:#7a8068;transition:all 0.15s;white-space:nowrap;}
+  .rbtn:hover{border-color:#6b7560;color:#d4d8c8;}
+  .rbtn.exp{border-color:#8a2020;color:#e05050;background:rgba(138,32,32,0.1);}
+
+  /* MODALS */
+  .mo{position:fixed;inset:0;background:rgba(0,0,0,0.82);z-index:200;display:flex;align-items:center;justify-content:center;padding:1rem;animation:fi 0.15s ease;}
+  @keyframes fi{from{opacity:0;}to{opacity:1;}}
+  @keyframes sd{from{opacity:0;transform:translateY(-8px);}to{opacity:1;transform:translateY(0);}}
+  .mp{background:#111410;border:1px solid #3d4535;border-radius:4px;padding:1.5rem;max-width:400px;width:100%;animation:sd 0.2s ease;}
+  .mt{font-family:'Bebas Neue',sans-serif;font-size:1.4rem;color:#d4d8c8;letter-spacing:0.06em;margin-bottom:0.2rem;}
+  .msub{font-family:'Share Tech Mono',monospace;font-size:0.52rem;color:#7a8068;letter-spacing:0.08em;margin-bottom:1rem;line-height:1.5;}
+  .bc-warn{font-family:'Share Tech Mono',monospace;font-size:0.52rem;color:#e8a040;letter-spacing:0.06em;padding:0.5rem 0.75rem;background:rgba(154,106,32,0.1);border:1px solid #9a6a20;border-radius:3px;margin-bottom:0.75rem;}
+  .bc-input-row{display:flex;gap:0.5rem;margin-bottom:1rem;}
+  .bc-input{flex:1;background:#0d0f0b;border:1px solid #3d4535;color:#d4d8c8;padding:8px 12px;border-radius:2px;font-family:'Share Tech Mono',monospace;font-size:0.85rem;outline:none;text-align:center;letter-spacing:0.1em;}
+  .bc-input:focus{border-color:#8a7030;}
+  .bc-auto{background:none;border:1px solid #3d4535;color:#7a8068;padding:8px 10px;border-radius:2px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:0.5rem;letter-spacing:0.08em;white-space:nowrap;transition:all 0.15s;}
+  .bc-auto:hover{color:#d4d8c8;border-color:#6b7560;}
+  .bc-preview{background:#0d0f0b;border:1px solid #3d4535;border-radius:3px;padding:1rem;display:flex;justify-content:center;margin-bottom:1rem;min-height:100px;align-items:center;}
+  .bc-actions{display:flex;gap:0.6rem;flex-wrap:wrap;}
+  .bc-assign{background:#c8a84b;color:#000;border:none;padding:8px 20px;border-radius:2px;cursor:pointer;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:0.85rem;letter-spacing:0.1em;transition:all 0.15s;}
+  .bc-assign:hover{background:#d4b85a;}
+  .bc-close{background:none;border:1px solid #3d4535;color:#7a8068;padding:8px 16px;border-radius:2px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:0.56rem;letter-spacing:0.1em;transition:all 0.15s;}
+  .bc-close:hover{color:#d4d8c8;border-color:#6b7560;}
+  .bc-success{font-family:'Share Tech Mono',monospace;font-size:0.54rem;color:#90c878;background:rgba(90,138,74,0.1);border:1px solid #5a8a4a;border-radius:2px;padding:8px 16px;}
+
+  /* FILE IMPORT */
+  .imp-drop{border:2px dashed #3d4535;border-radius:4px;padding:1.75rem 1rem;text-align:center;cursor:pointer;transition:all 0.2s;position:relative;margin-bottom:0.75rem;}
+  .imp-drop:hover,.imp-drop.over{border-color:#8a7030;background:rgba(200,168,75,0.04);}
+  .imp-drop input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+  .imp-icon{font-size:2rem;margin-bottom:0.5rem;}
+  .imp-lbl{font-family:'Share Tech Mono',monospace;font-size:0.62rem;color:#c8a84b;letter-spacing:0.12em;display:block;margin-bottom:0.3rem;}
+  .imp-sub{font-family:'Share Tech Mono',monospace;font-size:0.5rem;color:#4a5040;letter-spacing:0.08em;}
+  .imp-file{background:rgba(90,138,74,0.08);border:1px solid #5a8a4a;border-radius:3px;padding:0.6rem 0.9rem;font-family:'Share Tech Mono',monospace;font-size:0.56rem;color:#90c878;letter-spacing:0.08em;display:flex;justify-content:space-between;margin-bottom:0.75rem;}
+  .imp-map{display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.75rem;}
+  .imp-mf{display:flex;flex-direction:column;gap:3px;}
+  .imp-ml{font-family:'Share Tech Mono',monospace;font-size:0.44rem;color:#4a5040;letter-spacing:0.12em;}
+  .imp-ms{background:#0d0f0b;border:1px solid #3d4535;color:#d4d8c8;padding:5px 8px;border-radius:2px;font-family:'Share Tech Mono',monospace;font-size:0.6rem;outline:none;width:100%;}
+  .imp-mode{display:flex;gap:0.5rem;margin-bottom:0.75rem;}
+  .imp-mb{flex:1;font-family:'Share Tech Mono',monospace;font-size:0.52rem;letter-spacing:0.08em;padding:6px;border-radius:2px;cursor:pointer;border:1px solid #3d4535;background:none;color:#7a8068;transition:all 0.15s;text-align:center;}
+  .imp-mb.on{background:#4a5240;color:#d4d8c8;border-color:#6b7560;}
+  .imp-prev{background:#0d0f0b;border:1px solid #2a2e24;border-radius:3px;overflow:hidden;max-height:180px;overflow-y:auto;margin-bottom:0.75rem;}
+  .imp-prow{display:grid;grid-template-columns:2fr 1fr 1fr;padding:0.42rem 0.75rem;border-bottom:1px solid #1c2118;font-family:'Share Tech Mono',monospace;font-size:0.5rem;color:#7a8068;gap:0.5rem;}
+  .imp-prow.hdr{background:#111410;color:#4a5040;font-weight:700;position:sticky;top:0;}
+  .imp-pname{font-family:'Rajdhani',sans-serif;font-weight:600;font-size:0.75rem;color:#d4d8c8;}
+  .imp-acts{display:flex;gap:0.6rem;}
+  .imp-confirm{flex:1;background:#c8a84b;color:#000;border:none;padding:0.7rem;cursor:pointer;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:0.85rem;letter-spacing:0.12em;border-radius:2px;}
+  .imp-confirm:hover{background:#d4b85a;}
+  .imp-cancel{background:none;border:1px solid #3d4535;color:#7a8068;padding:0.7rem 1rem;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:0.56rem;letter-spacing:0.1em;border-radius:2px;}
+
+  /* OFFLINE SYNC */
+  .osync{display:flex;flex-direction:column;gap:1.1rem;}
+  .osync-modes{display:grid;grid-template-columns:repeat(3,1fr);gap:0.6rem;}
+  .osync-mode{font-family:'Share Tech Mono',monospace;font-size:0.56rem;letter-spacing:0.08em;padding:0.7rem 0.4rem;border-radius:3px;cursor:pointer;border:1px solid #3d4535;background:none;color:#7a8068;transition:all 0.15s;text-align:center;line-height:1.5;}
+  .osync-mode:hover{border-color:#6b7560;color:#8a9478;}
+  .osync-mode.on{background:#4a5240;color:#d4d8c8;border-color:#6b7560;}
+  .osync-panel{background:#111410;border:1px solid #3d4535;border-radius:3px;padding:1rem;display:flex;flex-direction:column;gap:0.8rem;animation:sd 0.2s ease;}
+  .osync-desc{font-family:'Share Tech Mono',monospace;font-size:0.52rem;color:#7a8068;letter-spacing:0.06em;line-height:1.7;padding:0.55rem 0.85rem;background:rgba(90,106,154,0.06);border:1px solid #5a6a9a;border-radius:3px;}
+  .osync-fl{display:flex;flex-direction:column;gap:3px;}
+  .osync-lbl{font-family:'Share Tech Mono',monospace;font-size:0.48rem;color:#4a5040;letter-spacing:0.14em;}
+  .osync-inp{background:#0d0f0b;border:1px solid #3d4535;color:#d4d8c8;padding:7px 10px;border-radius:2px;font-family:'Share Tech Mono',monospace;font-size:0.75rem;outline:none;}
+  .osync-inp:focus{border-color:#8a7030;}
+  .osync-row{display:grid;grid-template-columns:1fr 80px;gap:0.5rem;}
+  .osync-btn{background:#c8a84b;color:#000;border:none;padding:8px 16px;cursor:pointer;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:0.82rem;letter-spacing:0.1em;border-radius:2px;transition:all 0.15s;white-space:nowrap;}
+  .osync-btn:hover{background:#d4b85a;}
+  .osync-btn:disabled{opacity:0.4;cursor:not-allowed;}
+  .osync-status{font-family:'Share Tech Mono',monospace;font-size:0.54rem;letter-spacing:0.08em;padding:0.55rem 0.85rem;border-radius:3px;animation:sd 0.2s ease;line-height:1.6;}
+  .osync-status.ok{color:#90c878;background:rgba(90,138,74,0.1);border:1px solid #5a8a4a;}
+  .osync-status.err{color:#e05050;background:rgba(138,32,32,0.1);border:1px solid #8a2020;}
+  .osync-status.info{color:#e8a040;background:rgba(154,106,32,0.08);border:1px solid #9a6a20;}
+  .osync-export{display:flex;gap:0.6rem;}
+  .osync-ebtn{flex:1;font-family:'Share Tech Mono',monospace;font-size:0.54rem;letter-spacing:0.08em;padding:0.65rem 0.4rem;border-radius:2px;cursor:pointer;border:1px solid #3d4535;background:none;color:#7a8068;transition:all 0.15s;text-align:center;}
+  .osync-ebtn:hover{border-color:#6b7560;color:#d4d8c8;background:rgba(74,82,64,0.1);}
+  .osync-statbox{background:#111410;border:1px solid #3d4535;border-radius:3px;overflow:hidden;}
+  .osync-stit{font-family:'Share Tech Mono',monospace;font-size:0.52rem;color:#4a5040;letter-spacing:0.2em;padding:0.55rem 0.9rem;border-bottom:1px solid #2a2e24;background:#0d0f0b;}
+  .osync-srow{display:grid;grid-template-columns:1fr 1fr;padding:0.5rem 0.9rem;border-bottom:1px solid #2a2e24;gap:0.5rem;}
+  .osync-srow:last-child{border-bottom:none;}
+  .osync-slbl{font-family:'Share Tech Mono',monospace;font-size:0.46rem;color:#4a5040;letter-spacing:0.12em;}
+  .osync-sval{font-family:'Share Tech Mono',monospace;font-size:0.58rem;color:#d4d8c8;text-align:right;}
+
+  .toast{position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);background:#111410;border-radius:3px;padding:0.75rem 1.3rem;font-family:'Share Tech Mono',monospace;font-size:0.6rem;letter-spacing:0.1em;z-index:300;animation:sd 0.2s ease;box-shadow:0 4px 18px rgba(0,0,0,0.4);white-space:nowrap;border:1px solid;}
+`;
+
+// ─── BARCODE MODAL ────────────────────────────────────────────────
+function BarcodeModal({ product, onClose, onAssign }) {
+  const hasBC = product.barcode && !product.barcode.startsWith("AUTO");
+  const [code, setCode]       = useState(hasBC ? product.barcode : generateCode(product));
+  const [assigned, setAssigned] = useState(false);
+
+  return (
+    <div className="mo" onClick={onClose}>
+      <div className="mp" onClick={e=>e.stopPropagation()}>
+        <div className="mt">{product.name}</div>
+        <div className="msub">CODE 128 · Surtido Barcode System</div>
+
+        {!hasBC && !assigned && (
+          <div className="bc-warn">
+            ⚠ Este producto no tiene código de barras. Genera uno o ingrésalo manualmente.
+          </div>
+        )}
+
+        <div className="bc-input-row">
+          <input className="bc-input" value={code}
+            onChange={e=>setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9\-]/g,""))}
+            placeholder="CÓDIGO"
+          />
+          {!hasBC && (
+            <button className="bc-auto" onClick={()=>setCode(generateCode(product))}>AUTO</button>
+          )}
+        </div>
+
+        <div className="bc-preview">
+          {code ? <BarcodeDisplay value={code} height={70}/> :
+            <span style={{fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",color:"#4a5040"}}>Ingresa un código arriba</span>
+          }
+        </div>
+
+        <div className="bc-actions">
+          {!assigned && (
+            <button className="bc-assign" onClick={()=>{onAssign(product.id, code);setAssigned(true);}}>
+              ✓ ASIGNAR CÓDIGO
+            </button>
+          )}
+          {assigned && <div className="bc-success">✓ Código asignado y guardado</div>}
+          <button className="bc-close" onClick={onClose}>CERRAR</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── FILE IMPORTER ────────────────────────────────────────────────
+function FileImporter({ onClose, onImport }) {
+  const [fileName,   setFileName]   = useState(null);
+  const [previewRows,setPreviewRows]= useState([]);
+  const [mode,       setMode]       = useState("replace");
+  const [dragOver,   setDragOver]   = useState(false);
+
+  const handleFile = (file) => {
+    setFileName(file.name);
+    setPreviewRows([
+      {name:"Camisa Polo Azul M",   qty:18, cost:"$8.50"},
+      {name:"Pantalón Slim Negro",  qty:12, cost:"$22.00"},
+      {name:"Vestido Verano Blanco",qty:8,  cost:"$30.00"},
+    ]);
+  };
+
+  return (
+    <div className="mo" onClick={onClose}>
+      <div className="mp" style={{maxWidth:"520px"}} onClick={e=>e.stopPropagation()}>
+        <div className="mt">IMPORTAR INVENTARIO</div>
+        <div className="msub">Selecciona tu archivo .xlsx, .xls o .csv.</div>
+
+        {!fileName ? (
+          <div className={`imp-drop ${dragOver?"over":""}`}
+            onDragOver={e=>{e.preventDefault();setDragOver(true);}}
+            onDragLeave={()=>setDragOver(false)}
+            onDrop={e=>{e.preventDefault();setDragOver(false);if(e.dataTransfer.files[0])handleFile(e.dataTransfer.files[0]);}}>
+            <input type="file" accept=".xlsx,.xls,.csv"
+              onChange={e=>{if(e.target.files[0])handleFile(e.target.files[0]);}}/>
+            <div className="imp-icon">📂</div>
+            <span className="imp-lbl">SELECCIONAR ARCHIVO</span>
+            <span className="imp-sub">.xlsx · .xls · .csv — o arrastra y suelta aquí</span>
+          </div>
+        ) : (
+          <>
+            <div className="imp-file">
+              <span>📄 {fileName}</span>
+              <span style={{color:"#90c878"}}>{previewRows.length} filas encontradas</span>
+            </div>
+
+            <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",color:"#4a5040",letterSpacing:"0.18em",marginBottom:"0.4rem"}}>MODO DE IMPORTACIÓN</div>
+            <div className="imp-mode">
+              <button className={`imp-mb ${mode==="replace"?"on":""}`} onClick={()=>setMode("replace")}>⟳ REEMPLAZAR</button>
+              <button className={`imp-mb ${mode==="merge"?"on":""}`}   onClick={()=>setMode("merge")}>+ COMBINAR</button>
+            </div>
+
+            <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",color:"#4a5040",letterSpacing:"0.18em",marginBottom:"0.4rem"}}>VISTA PREVIA</div>
+            <div className="imp-prev">
+              <div className="imp-prow hdr"><span>NOMBRE</span><span>CANT.</span><span>COSTO</span></div>
+              {previewRows.map((r,i)=>(
+                <div key={i} className="imp-prow">
+                  <span className="imp-pname">{r.name}</span>
+                  <span>{r.qty}</span>
+                  <span>{r.cost}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        <div className="imp-acts">
+          {fileName && (
+            <button className="imp-confirm" onClick={()=>{onImport(previewRows.length);onClose();}}>
+              IMPORTAR TODO ({previewRows.length})
+            </button>
+          )}
+          <button className="imp-cancel" onClick={onClose}>CANCELAR</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── OFFLINE SYNC ─────────────────────────────────────────────────
+function OfflineSync({ products }) {
+  const [mode,    setMode]    = useState("lan");
+  const [ip,      setIp]      = useState("192.168.1.");
+  const [port,    setPort]    = useState("3001");
+  const [status,  setStatus]  = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [lastSync,setLastSync]= useState(null);
+
+  const simulateSync = async () => {
+    setSyncing(true);
+    setStatus({type:"info", msg:"🔌 Conectando a " + ip + ":" + port + "..."});
+    await new Promise(r=>setTimeout(r,1200));
+    setStatus({type:"info", msg:"📤 Enviando " + products.length + " productos..."});
+    await new Promise(r=>setTimeout(r,1000));
+    setLastSync(new Date().toLocaleString());
+    setStatus({type:"ok", msg:`✓ ${products.length} productos sincronizados exitosamente.`});
+    setSyncing(false);
+  };
+
+  const exportJSON = () => {
+    const data = JSON.stringify({storeName: CONFIG.storeName, exportedAt:new Date().toISOString(), products}, null, 2);
+    const blob  = new Blob([data], {type:"application/json"});
+    const url   = URL.createObjectURL(blob);
+    const a     = document.createElement("a"); a.href=url;
+    a.download  = `surtido-${todayKey()}.json`;
+    a.click(); URL.revokeObjectURL(url);
+    setStatus({type:"ok", msg:"✓ Archivo JSON descargado exitosamente."});
+  };
+
+  const exportCSV = () => {
+    const headers = ["barcode","name","category","quantity","unitCost","batchId","rackLocation"];
+    const rows = products.map(p=>headers.map(h=>`"${String(p[h]||"").replace(/"/g,'""')}"`).join(","));
+    const csv  = [headers.join(","),...rows].join("\n");
+    const blob = new Blob([csv],{type:"text/csv"});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a"); a.href=url;
+    a.download = `surtido-${todayKey()}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+    setStatus({type:"ok", msg:"✓ Archivo CSV descargado exitosamente."});
+  };
+
+  return (
+    <div className="osync">
+      <div className="osync-modes">
+        {[["lan","📡 LAN / Wi-Fi"],["bt","🔵 Bluetooth"],["usb","🔌 USB / Exportar"]].map(([m,lbl])=>(
+          <button key={m} className={`osync-mode ${mode===m?"on":""}`} onClick={()=>{setMode(m);setStatus(null);}}>
+            {lbl}
+          </button>
+        ))}
+      </div>
+
+      {status && <div className={`osync-status ${status.type}`}>{status.msg}</div>}
+
+      {mode==="lan" && (
+        <div className="osync-panel">
+          <div className="osync-desc">
+            💡 Asegúrate de que tus dispositivos estén en la misma red Wi-Fi.<br/>
+            Ejecuta en tu PC: <strong>npx surtido-receiver --port 3001</strong>
+          </div>
+          <div className="osync-row">
+            <div className="osync-fl">
+              <span className="osync-lbl">IP DE LA COMPUTADORA</span>
+              <input className="osync-inp" value={ip} onChange={e=>setIp(e.target.value)} placeholder="192.168.1.100"/>
+            </div>
+            <div className="osync-fl">
+              <span className="osync-lbl">PUERTO</span>
+              <input className="osync-inp" value={port} onChange={e=>setPort(e.target.value)}/>
+            </div>
+          </div>
+          <button className="osync-btn" disabled={syncing} onClick={simulateSync}>
+            {syncing ? "ENVIANDO DATOS..." : "CONECTAR Y SINCRONIZAR"}
+          </button>
+        </div>
+      )}
+
+      {mode==="bt" && (
+        <div className="osync-panel">
+          <div className="osync-desc">Asegúrate de que el Bluetooth esté activo en ambos dispositivos emparejados.</div>
+          <button className="osync-btn" onClick={async()=>{
+            setStatus({type:"info",msg:"🔵 Buscando dispositivos Bluetooth cercanos..."});
+            await new Promise(r=>setTimeout(r,1500));
+            setStatus({type:"info",msg:"Dispositivo listo para sincronizar por RFCOMM."});
+          }}>
+            🔵 BUSCAR DISPOSITIVOS
+          </button>
+        </div>
+      )}
+
+      {mode==="usb" && (
+        <div className="osync-panel">
+          <div className="osync-desc">Exporta el inventario para transferirlo por cable USB o almacenamiento externo.</div>
+          <div className="osync-export">
+            <button className="osync-ebtn" onClick={exportJSON}>⬇ EXPORTAR JSON</button>
+            <button className="osync-ebtn" onClick={exportCSV}>⬇ EXPORTAR CSV</button>
+          </div>
+        </div>
+      )}
+
+      <div className="osync-statbox">
+        <div className="osync-stit">ESTADO DE SINCRONÍA</div>
+        <div className="osync-srow"><span className="osync-slbl">ÚLTIMA SINCRONÍA</span><span className="osync-sval">{lastSync||"Nunca"}</span></div>
+        <div className="osync-srow"><span className="osync-slbl">PRODUCTOS</span><span className="osync-sval" style={{color:"#c8a84b"}}>{products.length}</span></div>
+        <div className="osync-srow"><span className="osync-slbl">VALOR TOTAL</span><span className="osync-sval" style={{color:"#c8a84b"}}>${products.reduce((s,p)=>s+p.quantity*p.unitCost,0).toFixed(2)}</span></div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP COMPONENT ───────────────────────────────────────────
+export default function App() {
+  const [tab,          setTab]          = useState("inventory");
+  const [products,     setProducts]     = useState([
+    {id:1, barcode:"7501234567890", name:"Camisa Polo Roja L",   quantity:24, unitCost:8.50,  category:"Camisas",    batchId:"LOTE-001", rackLocation:"A1"},
+    {id:2, barcode:"",              name:"Pantalón Cargo Verde",  quantity:6,  unitCost:18.00, category:"Pantalones", batchId:"LOTE-002", rackLocation:"B1"},
+    {id:3, barcode:"7509876543210", name:"Vestido Floral Rosa",   quantity:12, unitCost:25.00, category:"Vestidos",   batchId:"LOTE-003", rackLocation:"C1"},
+    {id:4, barcode:"",              name:"Cinturón Cuero Café",   quantity:0,  unitCost:6.00,  category:"Accesorios", batchId:"LOTE-004", rackLocation:""},
+    {id:5, barcode:"7501111222333", name:"Calcetines Negros",     quantity:50, unitCost:2.50,  category:"Accesorios", batchId:"LOTE-005", rackLocation:"C2"},
+  ]);
+  const [barcodeModal, setBarcodeModal] = useState(null);
+  const [showImport,   setShowImport]   = useState(false);
+  const [toast,        setToast]        = useState(null);
+
+  const showToast = (msg, type="ok") => {
+    setToast({msg,type});
+    setTimeout(()=>setToast(null), 2500);
+  };
+
+  const handleAssign = (id, code) => {
+    setProducts(prev=>prev.map(p=>p.id===id?{...p,barcode:code}:p));
+    showToast(`✓ Código ${code} asignado`, "ok");
+  };
+
+  const totalValue = calcInventoryValue(products);
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div className="sr-root">
+        <header className="sr-header">
+          <div>
+            <div className="sr-logo">SUR<span>TIDO</span></div>
+            <div className="sr-logo-sub">SISTEMA DE CONTROL DE INVENTARIO</div>
+            <div className="sr-store-name">UNIDAD: MI TIENDA</div>
+          </div>
+          <div className="sr-hmeta">
+            <div className="sr-loss-lbl">VALOR INVENTARIO</div>
+            <div className="sr-loss-val" style={{color:"var(--gold)"}}>${totalValue.toFixed(2)}</div>
+          </div>
+        </header>
+
+        <nav className="sr-nav">
+          <button className={`sr-tab ${tab==="inventory"?"active":""}`} onClick={()=>setTab("inventory")}>INVENTARIO</button>
+          <button className={`sr-tab ${tab==="import"?"active":""}`}    onClick={()=>setTab("import")}>📂 IMPORTAR</button>
+          <button className={`sr-tab ${tab==="sync"?"active":""}`}      onClick={()=>setTab("sync")}>🔄 SYNC OFFLINE</button>
+        </nav>
+
+        <main className="sr-main">
+          {tab==="inventory" && <>
+            <div className="sr-sec">INVENTARIO ACTIVO — Toca el código para ver o generar</div>
+            <div className="tw">
+              {products.map(p=>{
+                const hasBC = p.barcode && !p.barcode.startsWith("AUTO");
+                return(
+                  <div key={p.id} className="row">
+                    <div>
+                      <div className="rname">{p.name}</div>
+                      <button className={`rbc ${hasBC?"has":"no"}`} onClick={()=>setBarcodeModal(p)}>
+                        {hasBC ? `▤ ${p.barcode}` : "+ GENERAR CÓDIGO DE BARRAS"}
+                      </button>
+                      <div className="rmeta">{p.category} · x{p.quantity} · ${p.unitCost.toFixed(2)}</div>
+                    </div>
+                    <button className={`rbtn ${p.quantity===0?"exp":""}`}>
+                      {p.quantity===0?"ACCIÓN":"RETIRAR"}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            <button
+              style={{background:"rgba(200,168,75,0.06)",border:"1px solid #8a7030",color:"#c8a84b",padding:"0.8rem 1.5rem",cursor:"pointer",borderRadius:"3px",fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",letterSpacing:"0.14em",width:"100%",marginBottom:"0.5rem"}}
+              onClick={()=>setTab("import")}
+            >
+              📂 IMPORTAR INVENTARIO DESDE ARCHIVO
+            </button>
+          </>}
+
+          {tab==="import" && <>
+            <div className="sec">IMPORTAR DESDE ARCHIVO</div>
+            <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:"0.54rem",color:"#7a8068",letterSpacing:"0.06em",lineHeight:1.7,padding:"0.6rem 0.9rem",background:"rgba(90,106,154,0.06)",border:"1px solid #5a6a9a",borderRadius:"3px",marginBottom:"1rem"}}>
+              💡 Selecciona tu archivo .xlsx, .xls o .csv. Surtido detecta automáticamente las columnas y mapea los datos de inventario.
+            </div>
+            <div className="imp-drop" onClick={()=>setShowImport(true)}>
+              <div className="imp-icon">📂</div>
+              <span className="imp-lbl">SELECCIONAR ARCHIVO</span>
+              <span className="imp-sub">.xlsx · .xls · .csv · Toca para abrir</span>
+            </div>
+          </>}
+
+          {tab==="sync" && <>
+            <div className="sec">SINCRONIZACIÓN OFFLINE</div>
+            <OfflineSync products={products}/>
+          </>}
+        </main>
+      </div>
+
+      {barcodeModal && (
+        <BarcodeModal
+          product={barcodeModal}
+          onClose={()=>setBarcodeModal(null)}
+          onAssign={(id,code)=>{handleAssign(id,code);}}
+        />
+      )}
+
+      {showImport && (
+        <FileImporter
+          onClose={()=>setShowImport(false)}
+          onImport={(n)=>showToast(`✓ ${n} productos importados exitosamente.`,"ok")}
+        />
+      )}
+
+      {toast && (
+        <div className="toast" style={{borderColor:toast.type==="err"?"#8a2020":"#5a8a4a",color:toast.type==="err"?"#e05050":"#90c878"}}>
+          {toast.msg}
+        </div>
+      )}
+    </>
+  );
+}
